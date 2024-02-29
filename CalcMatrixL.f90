@@ -1,269 +1,217 @@
-Subroutine CalcMatrixL(context,nprow,npcol,myrow,mycol,total,numatom,atomtype,atominv,&
-                      &atomfit,totmaxfit,invfit,fdenorm,lamb,totalmax,fitmaxidx)
-
-!==========================================================!
-! Purpose: Calc matrix L                                   !
-! L = S^-1(F+Z)                                            !
-!==========================================================!
-
-use mpi
-
-implicit none
-
-!----------------------------------------------------------!
-!input                                                     !
-!                                                          !
-!blacs variables: context, nprow, npcol, myrow, mycol      !
-!total: number of selection fitting function               !
-!numatom: number of total atoms                            !
-!atomtype: number of type of atoms                         !
-!totmaxfit: number of total fitting function               !
-!atominv: array to pass from number of atom to type of atom!
-!atomfit: array wirh first fitting function per atom       !
-!invfit: array to select fitting function                  !
-!fdenorm: array to denormalization of fitting function     !
-!                                                          !
-!----------------------------------------------------------!
-
-integer, intent(in) :: context, nprow,npcol,myrow,mycol, total, numatom, atomtype, totmaxfit
-integer, intent(in) :: totalmax, fitmaxidx(numatom)
-integer, intent(in) :: atominv(numatom),atomfit(numatom),invfit(atomtype,totmaxfit)
-real*8, intent(in) :: lamb
-real*8, intent(inout) :: fdenorm(total)
+subroutine CalcMatrixL ()
+!
+   use KF
+   use MasterModule
+   use DimensionsModule
+   use SCFUtilsModule
+   use DistributedMatrixModule
+   use adf_blacs
+   use PoltddftModule
+   use ppCommonsModule
+!
+   use Vartypes
+   use ADFGlobalInputModule
+   use ModelDataModule, only: gModel
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!PIERPAOLO
+   use Vartypes
+   use HFParallelizationModule
+   use ModelDataModule
+   use XCFunctionalDescriptorModule
+   use RangeSeparatedCalculation
+   use XCRangeSeparatedCalcDescriptor
+   use fitfitint2RangeSeparatedModule
+   use ADFFilesModule
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
 
-! MPI
-integer :: ierr, info, fh, fs, fs3c
-integer :: status(MPI_STATUS_SIZE)
-external :: descinit, numroc, pdelset, INDXL2G
-integer :: numroc, INDXL2G
+   implicit none
 
-! Matrix
-integer :: Nloc, Mloc, S3CNloc 
-real*8, allocatable :: A(:,:), B(:,:)!, work(:)
-real*8, allocatable :: S3C(:,:)
-!integer, allocatable :: ipiv(:)
-integer :: descMat(9), descS3C(9)
-real*8 :: aval, val
+   type(DistributedMatrixType) :: S, F, Z, eigvec, Ztransp, S2, F2, Frs, S3, Z2, Zrs
 
-character*9 :: atompair
-character*4 :: fiti
-integer :: i, j, k, l, p, q, ncount, db
-integer :: ja, jb, nfaa, nfbb, istat
-integer(KIND=MPI_OFFSET_KIND) :: offset, rig, col, temp
+   real(KREAL)   :: eigval(gDims%nsfos)
+   integer(KINT) :: context1, block
+   integer(KINT) :: info
+   integer(KINT) :: iu, iu65, iu69
+   logical       :: HDA_fitted
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!PIERPAOLO
+   integer(KINT) :: iurs, iu777
+   logical       :: IsRangeSeparated
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+   integer(KINT) :: iexist64
 
-real*8 :: t1, t2, dt
+!  ---------------------------------
+!  opem tape with fit integrals sfit
+!  ---------------------------------
 
+   call GetBLACSContextAndBlocksize(gDims%nsfos, context1, block)
 
-! Computation of local matrix size
-Mloc = numroc( total, total/nprow, myrow, 0, nprow )
-Nloc = numroc( total, total/nprow, mycol, 0, npcol )
+   call timers ('pp')
 
-S3CNloc = numroc( totalmax, total/nprow, mycol, 0, npcol )
+   call kfopfl (iu, 'TAPE59')
+   call ReadPacLowAOMatrixToDist(iu, 'FitFit%fitfit', F, gDims%nsfos, context1, block)
+   call kfclfl (iu)
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!PIERPAOLO
+   IsRangeSeparated = IsHFRangeSeparatedFunctional(gModel%xcDescriptor)
 
-allocate( A( Mloc, Nloc ) )
-allocate( B( Mloc, Nloc ) )
+   if (IsRangeSeparated) then
+      call kfopfl (iurs, 'TAPE77')
+      call ReadPacLowAOMatrixToDist(iu, 'FitFitRS%fitfitRS', Frs, gDims%nsfos, context1, block)
+      call kfclfl (iurs)
+   endif
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+!write(iuout,*) "matrix F elements PIER", F%rValues
+!write(iuout,*) "matrix Frs elements PIER", Frs%rValues
 
-allocate( S3C(Mloc,S3CNloc))
+   call kfopfl (iu, 'TAPE60')
+   call ReadPacUprAOMatrixToDist(iu, 'MatrixZ%Z', Z, gDims%nsfos, context1, block)
+   call kfclfl (iu)
+!!!!!!!!!!!!!!!!!!!!!!!!!PIERPAOLO
+if (IsRangeSeparated) call NewDistributedMatrix(Z2, Z, copyData=.true.)
+!!!!!!!!!!!!!!!!!!!!!!!!!!!
+   call InplaceAdd(Z, F)
+   call Scale(Z,gPoltddft%lambda)
 
-! Descriptos
-call descinit(descMat, total, total, total/nprow, total/nprow, 0, 0, context, max(1,Mloc), info)
+!!!!!!!!!!!!!!!!PIERPAOLO
+if (IsRangeSeparated) then
+   call kfopfl (iu777, 'TAPE777')
+   call ReadPacUprAOMatrixToDist(iu777, 'MatrixZrs%Zrs', Zrs, gDims%nsfos, context1, block)
+   call kfclfl (iu777)
+   call InplaceAdd(Z2, Frs)
+   call InplaceSubtract(Z2 , Zrs )
+   call Scale(Z2,gPoltddft%lambda)
+end if 
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
-call descinit(descS3C, total, totalmax, total/nprow, total/nprow, 0, 0, context, max(1,Mloc), info)
+   call DeleteDistributedMatrix(F)
 
-A = 0.0d0
-B = 0.0d0 
-fdenorm = 0.0d0
+   call kfopfl (iu, 'TAPE58')
+   call ReadPacLowAOMatrixToDist(iu, 'Fitsfit%sfit', S, gDims%nsfos, context1, block)
+   call kfclfl (iu)
 
-S3C = 0.0d0
+   call kfcrfl (iu, 'TAPE61')
+   call kfcrsc (iu, 'Matrix')
 
-! Read overlap fitting function matrix
+   call StoreDistributedMatrix (S, iu, 1, 'S')
 
-OPEN (UNIT=100, FILE= 'sfit', STATUS='OLD', ACTION='READ', IOSTAT=istat)
-do i = 1, numatom
-   do j = 1, i
-      read (100,*) atompair, ja, jb
-      if ( ja == 0 .and. jb == 0 ) goto 1000
-      read (100,*) fiti, nfaa, fiti, nfbb
-      ncount = 0
-      readloop0: do
-         read (100, 6031) l, k, aval
-         if ( k == 0 .or. l == 0 ) exit
-         ncount = ncount + 1
+   call gInput%Get ('PolTDDFT%HDA_fitted', HDA_fitted)
 
-         p = invfit(atominv(ja),k)
-         q = invfit(atominv(jb),l)              
+   if ((HDA_fitted).and.(.not. gModel%lhybrid)) call stopit('HDA_fitted support only hybrid functionals')
 
-         if (ja/=jb) then
-            if (p/=0) then
-               call pdelset(S3C, p+atomfit(ja),l+fitmaxidx(jb), descS3C, aval) 
-            endif
-            if (q/=0) then
-               call pdelset(S3C, q+atomfit(jb),k+fitmaxidx(ja), descS3C, aval)
-            endif
-         endif
+   if (kfexfl('TAPE64')) then
+      iexist64 = 1
+   end if
+ 
+   call ppNodeBarrier
+   call ppcbi(iexist64,'iexst64')
+   if ((iexist64 ==1).and.(HDA_fitted)) then
+      HDA_fitted = .false.
+   end if
 
-         if (p==0 .or. q==0) CYCLE
-         if (ja==jb .and. k == l) then
-            fdenorm(p+atomfit(ja)) = SQRT(aval)
-         endif
-         call pdelset( A, p+atomfit(ja),q+atomfit(jb), descMat, aval)
-         call pdelset( A, q+atomfit(jb),p+atomfit(ja), descMat, aval)
-          
-      enddo readloop0
-   enddo
-enddo
+   if (HDA_fitted) then
+!write(iuout,*) "creates S2 PIER"
+      call NewDistributedMatrix(S2, S, copyData=.true.)
+      call NewDistributedMatrix(S3, S, copyData=.true.)
+   end if
 
+   info = 0 
+   if (context1 == CONTEXT_DUPLICATED_MATRIX) then
+      call dposv('L',gDims%nsfos,gDims%nsfos,S%rValues,gDims%nsfos,Z%rValues,gDims%nsfos,info)
+#ifdef D_SCALAPACK
+   else if (context1 /= CONTEXT_PROC_OUTSIDE_CTXT) then
+      call pdposv('L',gDims%nsfos,gDims%nsfos,S%rValues,1,1,S%desc,Z%rValues,1,1,Z%desc,info)
+#endif
+   endif
+   if (info /= 0) then
+      write(iuout,*) 'dposv info', info
+      call LoadDistributedMatrix (S, iu, 1, 'S')
+      call Diagonalize(S, eigval, eigvec, info)
+      write(iuout,'(A/(10E14.5))')'Eigenvalues of the fit overlap matrix',eigval
+      call stopit('CalcMatrixL: [p]dposv returned non-zero status')
+   end if
 
-1000 CLOSE (100)
+   call StoreDistributedMatrix (Z, iu, 1, 'L') 
 
-!Write overlap fitting function matrix in binary file
+   if ((HDA_fitted).and.(.not.IsRangeSeparated)) then
+      call NewDistributedMatrix(Ztransp, Z, copyData=.false.)
+      call SetConstant(Ztransp, 0.0_KREAL)
+      call InplaceAdd(Ztransp, Z, .true.)
 
-call MPI_FILE_OPEN(MPI_COMM_WORLD,'matrixS.out',MPI_MODE_CREATE+MPI_MODE_WRONLY&
-                  &,MPI_INFO_NULL,fs,ierr)
+!write(iuout,*) "inside .not.IsRangeSeparated PIER"
 
-CALL MPI_TYPE_SIZE(MPI_DOUBLE_PRECISION, db, ierr)
+      if (context1 == CONTEXT_DUPLICATED_MATRIX) then
+         call dposv('L',gDims%nsfos,gDims%nsfos,S2%rValues,gDims%nsfos,Ztransp%rValues,gDims%nsfos,info)
+#ifdef D_SCALAPACK
+      else if (context1 /= CONTEXT_PROC_OUTSIDE_CTXT) then
+         call pdposv('L',gDims%nsfos,gDims%nsfos,S2%rValues,1,1,S2%desc,Ztransp%rValues,1,1,Ztransp%desc,info)
+#endif
+      endif
 
-DO i = 1, Nloc
-   col = INDXL2G(i, total/nprow, mycol, 0, npcol)
-   temp = (col - 1) * total
-   IF (descMat(9)>descMat(5)) then
-      rig = INDXL2G(1, descMat(5), myrow, 0, nprow)
-      offset = (temp + rig -1) * db
-      CALL MPI_FILE_WRITE_AT(fs, offset, A(1,i), descMat(5),&
-                            & MPI_DOUBLE_PRECISION,status, ierr)
+      call DeleteDistributedMatrix(S2)
+      call kfcrfl(iu65,'TAPE65')
+      call kfopfl(iu65,'TAPE65')
+      call kfcrsc(iu65,'Q')
+      call StoreDistributedMatrix (Ztransp, iu65, 1, 'Q')
+      call kfclfl(iu65)
 
-      rig = INDXL2G(descMat(5)+1, descMat(5), myrow, 0, nprow)
-      offset = (temp + rig -1) * db
-      CALL MPI_FILE_WRITE_AT(fs,offset,A(1+descMat(5),i),descMat(9)-descMat(5),&
-                            & MPI_DOUBLE_PRECISION,status, ierr)
-   ELSE
-      rig = INDXL2G(1, descMat(5), myrow, 0, nprow)
-      offset = (temp+rig-1)*db
-      CALL MPI_FILE_WRITE_AT(fs,offset,A(1,i),descMat(5),&
-                            & MPI_DOUBLE_PRECISION,status,ierr)
-   ENDIF
-ENDDO
+      call DeleteDistributedMatrix(Ztransp)
 
-call MPI_FILE_CLOSE(fs,ierr)
+   end if
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!PIERPAOLO
+   if (IsRangeSeparated) then
 
-call MPI_FILE_OPEN(MPI_COMM_WORLD,'matrixS3C.out',MPI_MODE_CREATE+MPI_MODE_WRONLY&
-                  &,MPI_INFO_NULL,fs3c,ierr)
+!write(iuout,*) "in IsRangeSeparated PIER"
 
-DO i = 1, S3CNloc
-   col = INDXL2G(i, total/nprow, mycol, 0, npcol)
-   temp = (col - 1) * total
-   IF (descS3C(9)>descS3C(5)) then
-      rig = INDXL2G(1, descS3C(5), myrow, 0, nprow)
-      offset = (temp + rig -1) * db
-      CALL MPI_FILE_WRITE_AT(fs3c, offset, S3C(1,i), descS3C(5),&
-                            & MPI_DOUBLE_PRECISION,status, ierr)
+   info = 0
+   if (context1 == CONTEXT_DUPLICATED_MATRIX) then
+      call dposv('L',gDims%nsfos,gDims%nsfos,S2%rValues,gDims%nsfos,Z2%rValues,gDims%nsfos,info)
+#ifdef D_SCALAPACK
+   else if (context1 /= CONTEXT_PROC_OUTSIDE_CTXT) then
+      call pdposv('L',gDims%nsfos,gDims%nsfos,S2%rValues,1,1,S2%desc,Z2%rValues,1,1,Frs%desc,info)
+#endif
+   endif
+   if (info /= 0) then
+      write(iuout,*) 'dposv info', info
+      call LoadDistributedMatrix (S, iu, 1, 'S')
+      call Diagonalize(S, eigval, eigvec, info)
+      write(iuout,'(A/(10E14.5))')'Eigenvalues of the fit overlap matrix',eigval
+      call stopit('CalcMatrixL: [p]dposv returned non-zero status')
+   end if
 
-      rig = INDXL2G(descS3C(5)+1, descS3C(5), myrow, 0, nprow)
-      offset = (temp + rig -1) * db
-      CALL MPI_FILE_WRITE_AT(fs3c,offset,S3C(1+descS3C(5),i),descS3C(9)-descS3C(5),&
-                            & MPI_DOUBLE_PRECISION,status, ierr)
-   ELSE
-      rig = INDXL2G(1, descS3C(5), myrow, 0, nprow)
-      offset = (temp+rig-1)*db
-      CALL MPI_FILE_WRITE_AT(fs3c,offset,S3C(1,i),descS3C(5),&
-                            & MPI_DOUBLE_PRECISION,status,ierr)
-   ENDIF
-ENDDO
+      call NewDistributedMatrix(Ztransp, Z2, copyData=.false.)
+      call SetConstant(Ztransp, 0.0_KREAL)
+      call InplaceAdd(Ztransp, Z2, .true.)
 
-call MPI_FILE_CLOSE(fs3c,ierr)
+      if (context1 == CONTEXT_DUPLICATED_MATRIX) then
+         call dposv('L',gDims%nsfos,gDims%nsfos,S3%rValues,gDims%nsfos,Ztransp%rValues,gDims%nsfos,info)
+#ifdef D_SCALAPACK
+      else if (context1 /= CONTEXT_PROC_OUTSIDE_CTXT) then
+         call pdposv('L',gDims%nsfos,gDims%nsfos,S3%rValues,1,1,S3%desc,Ztransp%rValues,1,1,Ztransp%desc,info)
+#endif
+      endif
 
-deallocate (S3C)
+      call DeleteDistributedMatrix(S2)
+      call DeleteDistributedMatrix(S3)
+      call kfcrfl(iu65,'TAPE65')
+      call kfopfl(iu65,'TAPE65')
+      call kfcrsc(iu65,'Q')
+      call StoreDistributedMatrix (Ztransp, iu65, 1, 'Q')
+      call kfclfl(iu65)
 
-!Read matrix F
+      call DeleteDistributedMatrix(Ztransp)
+       call DeleteDistributedMatrix(Frs)
 
-OPEN (UNIT=101, FILE= 'matrixF', STATUS='OLD', ACTION='READ', IOSTAT=istat)
-do i = 1, numatom
-   do j = 1, i
-      read (101,*) atompair, ja, jb
-      read (101,*) fiti, nfaa, fiti, nfbb
-      ncount = 0
-      readloop1: do
-         read (101, 6031) l, k, aval
-         if ( k == 0 .or. l == 0 ) exit
-         ncount = ncount + 1
+   end if
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+   call kfclfl (iu)
 
-         p = invfit(atominv(ja),k)
-         q = invfit(atominv(jb),l)
-         if (p==0 .or. q==0) CYCLE
-         call pdelset( B, p+atomfit(ja),q+atomfit(jb), descMat, aval)
-         call pdelset( B, q+atomfit(jb),p+atomfit(ja), descMat, aval)
+   call DeleteDistributedMatrix(S)
+   call DeleteDistributedMatrix(Z)
 
-      enddo readloop1
-   enddo
-enddo
+   call timere ('pp')   
 
-CLOSE (101)
+   call adf_end_blacs(context1)
 
+!  ======================================================================
 
-!Read matrix Z and sum with matrix F
-
-OPEN (UNIT=102, FILE= 'matrixZ', STATUS='OLD', ACTION='READ', IOSTAT=istat)
-do i = 1, numatom
-   do j = 1, i
-      read (102,*) atompair, ja, jb
-      read (102,*) fiti, nfaa, fiti, nfbb
-      ncount = 0
-      readloop2: do
-         read (102, 6031) k, l, aval
-         if ( k == 0 .or. l == 0 ) exit
-         ncount = ncount + 1
-
-         p = invfit(atominv(ja),k)
-         q = invfit(atominv(jb),l)
-         if (p==0 .or. q==0) CYCLE
-         call pdelget('A', 'D', val, B, p+atomfit(ja),q+atomfit(jb), descMat)
-         aval = aval + val
-         call pdelset(B, p+atomfit(ja), q+atomfit(jb), descMat, aval*lamb)
-         call pdelset(B, q+atomfit(jb), p+atomfit(ja), descMat, aval*lamb)
-
-      enddo readloop2
-   enddo
-enddo
-CLOSE (102)
-
-! Linear system equations solver
-!call pdgesv(total, total, A, 1, 1, descMat, ipiv, B, 1, 1, descMat, info )
-call pdposv('U', total, total, A, 1, 1, descMat, B, 1, 1, descMat, info)
-
-!Write matrix L in binary file
-
-call MPI_FILE_OPEN(MPI_COMM_WORLD,'matrixL.out',MPI_MODE_CREATE+MPI_MODE_WRONLY&
-                  &,MPI_INFO_NULL,fh,ierr)
-
-CALL MPI_TYPE_SIZE(MPI_DOUBLE_PRECISION, db, ierr)
-
-DO i = 1, Nloc
-   col = INDXL2G(i, total/nprow, mycol, 0, npcol)
-   temp = (col - 1) * total
-   IF (descMat(9)>descMat(5)) then
-      rig = INDXL2G(1, descMat(5), myrow, 0, nprow)
-      offset = (temp + rig -1) * db
-      CALL MPI_FILE_WRITE_AT(fh, offset, B(1,i), descMat(5),&
-                            & MPI_DOUBLE_PRECISION,status, ierr)
-      rig = INDXL2G(descMat(5)+1, descMat(5), myrow, 0, nprow)
-      offset = (temp + rig -1) * db
-      CALL MPI_FILE_WRITE_AT(fh,offset,B(1+descMat(5),i),descMat(9)-descMat(5),&
-                            & MPI_DOUBLE_PRECISION,status, ierr)
-   ELSE
-      rig = INDXL2G(1, descMat(5), myrow, 0, nprow)
-      offset = (temp+rig-1)*db
-      CALL MPI_FILE_WRITE_AT(fh,offset,B(1,i),descMat(5),&
-                            & MPI_DOUBLE_PRECISION,status,ierr)
-   ENDIF
-ENDDO
-
-call MPI_FILE_CLOSE(fh,ierr)
-
-deallocate( A )
-deallocate( B )
-
-6031 format(1x,i5,1x,i5,2x,1e22.14)
-
-End Subroutine CalcMatrixL
+end subroutine CalcMatrixL
 
